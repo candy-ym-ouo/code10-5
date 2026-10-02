@@ -217,13 +217,16 @@ const mediaRoutes: FastifyPluginAsync = async (app) => {
     const { mediaId } = request.params as { mediaId: string };
     const media = await prisma.mediaAsset.findFirst({ where: { id: mediaId, userId: request.authUser!.id } });
     if (!media) throw notFound();
-    if (!["FAILED", "UPLOADED"].includes(media.status)) {
-      throw new AppError(409, "INVALID_MEDIA_STATE", "当前音频不需要重试解析");
+    // 仅终态 FAILED 可重试：PROCESSING/UPLOADED 说明任务仍在队列中或正在执行
+    if (media.status !== "FAILED") {
+      throw new AppError(409, "INVALID_MEDIA_STATE", "当前音频正在处理中或无需重试");
     }
-    await prisma.mediaAsset.update({
-      where: { id: media.id },
+    // 条件翻转保证幂等：重复点击不会在已被重新入队后再次投递
+    const reopened = await prisma.mediaAsset.updateMany({
+      where: { id: media.id, status: "FAILED" },
       data: { status: "UPLOADED", failureCode: null, failureMessage: null },
     });
+    if (reopened.count === 0) return { success: true, status: media.status };
     await enqueueProbe(media.id);
     return { success: true, status: "UPLOADED" };
   });

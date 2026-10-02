@@ -1,6 +1,6 @@
-import { spawn } from "node:child_process";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
+import { permanentError, retryableError } from "./media-errors.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -22,25 +22,62 @@ interface FFProbeOutput {
   }>;
 }
 
-export async function probeAudio(filePath: string): Promise<ProbeResult> {
-  const { stdout } = await execFileAsync(
-    "ffprobe",
-    [
-      "-v",
-      "error",
-      "-show_entries",
-      "format=duration:stream=codec_type,codec_name,sample_rate,channels,duration",
-      "-of",
-      "json",
-      filePath,
-    ],
-    { timeout: 120_000, maxBuffer: 4 * 1024 * 1024 },
-  );
-  const parsed = JSON.parse(stdout) as FFProbeOutput;
+export interface MediaTimeouts {
+  /** ffprobe 整体超时（默认 30s） */
+  probeTimeoutMs: number;
+  /** ffmpeg 波形生成整体超时（默认 90s） */
+  peaksTimeoutMs: number;
+}
+
+export const DEFAULT_TIMEOUTS: MediaTimeouts = {
+  probeTimeoutMs: 30_000,
+  peaksTimeoutMs: 90_000,
+};
+
+/** execFile 超时会被 Node 杀掉并以 `Command killed ... (SIGKILL)` / killed=true 返回 */
+function isTimeoutError(error: unknown): boolean {
+  const candidate = error as { killed?: boolean; signal?: string; code?: string | number } | null;
+  return candidate?.killed === true || candidate?.signal === "SIGKILL" || candidate?.signal === "SIGTERM";
+}
+
+export async function probeAudio(filePath: string, timeouts: MediaTimeouts = DEFAULT_TIMEOUTS): Promise<ProbeResult> {
+  let stdout: string;
+  try {
+    const result = await execFileAsync(
+      "ffprobe",
+      [
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration:stream=codec_type,codec_name,sample_rate,channels,duration",
+        "-of",
+        "json",
+        filePath,
+      ],
+      { timeout: timeouts.probeTimeoutMs, maxBuffer: 4 * 1024 * 1024 },
+    );
+    stdout = result.stdout;
+  } catch (error) {
+    if (isTimeoutError(error)) throw retryableError("PROBE_TIMEOUT", "probe", error);
+    const candidate = error as { code?: string; stderr?: string; message?: string } | null;
+    if (candidate?.code === "ENOENT") throw retryableError("PROBE_FAILED", "probe", error);
+    // 保留 ffprobe 的 stderr 文本，交由 classifyError 区分文件永久损坏与瞬时失败
+    const detail = (candidate?.stderr ?? candidate?.message ?? "").trim();
+    throw retryableError("PROBE_FAILED", "probe", new Error(detail || "ffprobe failed"));
+  }
+
+  let parsed: FFProbeOutput;
+  try {
+    parsed = JSON.parse(stdout) as FFProbeOutput;
+  } catch (error) {
+    throw permanentError("INVALID_MEDIA", "probe", error);
+  }
   const stream = parsed.streams?.find((item) => item.codec_type === "audio");
-  if (!stream) throw new Error("NO_AUDIO_STREAM");
+  if (!stream) throw permanentError("NO_AUDIO_STREAM", "probe");
   const durationSeconds = Number(parsed.format?.duration ?? stream.duration ?? 0);
-  if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) throw new Error("INVALID_DURATION");
+  if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) {
+    throw permanentError("INVALID_DURATION", "probe");
+  }
   return {
     durationMs: BigInt(Math.round(durationSeconds * 1000)),
     codec: stream.codec_name ?? "unknown",
@@ -49,7 +86,11 @@ export async function probeAudio(filePath: string): Promise<ProbeResult> {
   };
 }
 
-export async function generatePeaks(filePath: string, bucketCount = 1600): Promise<number[]> {
+export async function generatePeaks(
+  filePath: string,
+  bucketCount = 1600,
+  timeouts: MediaTimeouts = DEFAULT_TIMEOUTS,
+): Promise<number[]> {
   const chunks: Buffer[] = [];
   await new Promise<void>((resolve, reject) => {
     const child = spawn(
@@ -58,20 +99,37 @@ export async function generatePeaks(filePath: string, bucketCount = 1600): Promi
       { stdio: ["ignore", "pipe", "pipe"] },
     );
     let stderr = "";
+    let settled = false;
+
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.kill("SIGKILL");
+      reject(retryableError("PEAKS_TIMEOUT", "peaks", new Error(`ffmpeg exceeded ${timeouts.peaksTimeoutMs}ms`)));
+    }, timeouts.peaksTimeoutMs);
+
     child.stdout.on("data", (chunk: Buffer) => chunks.push(chunk));
     child.stderr.on("data", (chunk: Buffer) => {
       stderr += chunk.toString().slice(0, 2000);
     });
-    child.on("error", reject);
+    child.on("error", (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(retryableError("PEAKS_FAILED", "peaks", error));
+    });
     child.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
       if (code === 0) resolve();
-      else reject(new Error(stderr || `ffmpeg exited with ${code}`));
+      else reject(retryableError("PEAKS_FAILED", "peaks", new Error(stderr || `ffmpeg exited with ${code}`)));
     });
   });
 
   const samples = Buffer.concat(chunks);
   const sampleCount = Math.floor(samples.length / 2);
-  if (sampleCount === 0) throw new Error("EMPTY_PCM");
+  if (sampleCount === 0) throw permanentError("EMPTY_PCM", "peaks");
   const actualBuckets = Math.min(bucketCount, sampleCount);
   const bucketSize = Math.max(1, Math.ceil(sampleCount / actualBuckets));
   const result: number[] = [];
