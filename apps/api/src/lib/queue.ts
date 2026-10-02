@@ -17,8 +17,8 @@ export async function enqueueProbe(mediaId: string): Promise<void> {
     { mediaId },
     {
       jobId: `probe:${mediaId}:${Date.now()}`,
-      attempts: 3,
-      backoff: { type: "exponential", delay: 3000 },
+      attempts: 4,
+      backoff: { type: "exponential", delay: 5000 },
       removeOnComplete: 100,
       removeOnFail: 500,
     },

@@ -17,8 +17,8 @@ export function getS3(): S3Client {
   return client;
 }
 
-export async function getObjectStream(objectKey: string): Promise<Readable> {
-  const object = await getS3().send(new GetObjectCommand({ Bucket: getConfig().S3_BUCKET, Key: objectKey }));
+export async function getObjectStream(objectKey: string, signal?: AbortSignal): Promise<Readable> {
+  const object = await getS3().send(new GetObjectCommand({ Bucket: getConfig().S3_BUCKET, Key: objectKey }), { abortSignal: signal });
   if (!object.Body) throw new Error("object body is empty");
   return object.Body as Readable;
 }

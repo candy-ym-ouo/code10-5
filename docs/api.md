@@ -87,6 +87,8 @@ Refresh Cookie 路径为 `/api/v1/auth`，生产环境在 HTTPS 下自动使用 
 
 预签名请求的 `Content-Type` 和 `x-amz-meta-sha256` 已纳入签名，必须使用返回的 `requiredHeaders` 原样上传。
 
+媒体状态机：`PENDING_UPLOAD` → `UPLOADED` → `PROCESSING` → `READY` / `FAILED`。探测按文件大小分级限时（下载、格式探测、波形生成各自独立超时），超时与网络等瞬态错误由队列自动退避重试，次数耗尽后落入 `FAILED`；文件损坏、无音轨等永久错误直接落入 `FAILED` 不再重试。`FAILED` 可通过 `retry-probe` 重新投递。`failureCode` 取值：`NO_AUDIO_STREAM`、`INVALID_DURATION`、`EMPTY_PCM`、`MEDIA_UNREADABLE`、`MEDIA_OBJECT_MISSING`、`MEDIA_DOWNLOAD_FAILED`、`DOWNLOAD_TIMEOUT`、`PROBE_TIMEOUT`、`PEAKS_TIMEOUT`、`MEDIA_PROBE_FAILED`。
+
 ## 标记
 
 | 方法 | 路径 | 说明 |
